@@ -1,0 +1,392 @@
+"""
+qr_node.py
+==========
+Runs on the QR computer (screen + camera).
+Opens a setup popup automatically — no terminal input needed.
+Sender and receiver run simultaneously on separate threads.
+"""
+
+import socket
+import threading
+import json
+import time
+import os
+import base64
+import queue
+import cv2
+import numpy as np
+import tkinter as tk
+from tkinter import simpledialog, messagebox
+from pyzbar.pyzbar import decode, ZBarSymbol
+
+import qr_protocol
+
+MY_NAME    = ""
+CHAT_PORT  = 6000
+
+outgoing_queue = queue.Queue()
+chat_conn      = None
+chat_lock      = threading.Lock()
+
+# ── SEND TO CHAT UI ───────────────────────────────────────────────
+def send_to_chat(payload):
+    global chat_conn
+    with chat_lock:
+        if chat_conn is None:
+            return
+        try:
+            chat_conn.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+        except Exception:
+            chat_conn = None
+
+# ── CHAT SOCKET SERVER ────────────────────────────────────────────
+def chat_server_thread():
+    global chat_conn
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("0.0.0.0", CHAT_PORT))
+    server.listen(1)
+    print(f"[Chat server] Listening on port {CHAT_PORT}...")
+    while True:
+        conn, addr = server.accept()
+        print(f"[Chat server] Chat computer connected from {addr}")
+        with chat_lock:
+            chat_conn = conn
+        buffer = b""
+        try:
+            while True:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                buffer += chunk
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    line = line.strip()
+                    if line:
+                        try:
+                            outgoing_queue.put(json.loads(line.decode("utf-8")))
+                        except Exception as e:
+                            print(f"[Chat server] Parse error: {e}")
+        except Exception as e:
+            print(f"[Chat server] Error: {e}")
+        finally:
+            with chat_lock:
+                chat_conn = None
+            print("[Chat server] Chat computer disconnected.")
+
+# ── SENDER THREAD ─────────────────────────────────────────────────
+def sender_thread():
+    """
+    Waits for messages from the chat UI and sends them as QR codes.
+    Uses camera index 1 for ACKs (separate from receiver's camera 0).
+    Falls back to camera 0 if only one camera available.
+    Key fix: camera is opened ONCE at startup and kept open — never
+    released between messages. This prevents the crash after each send.
+    """
+    WINDOW = "QR Sender"
+
+    # Open ACK camera ONCE here — keep it alive forever
+    # Try camera 1 first (second camera), fall back to 0
+    ack_cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
+    if not ack_cap.isOpened():
+        ack_cap = cv2.VideoCapture(1)
+    if not ack_cap.isOpened():
+        print("[Sender] No second camera, using camera 0 for ACKs")
+        ack_cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    if not ack_cap.isOpened():
+        ack_cap = cv2.VideoCapture(0)
+
+    def scan_for_ack(timeout=8):
+        start = time.time()
+        while time.time() - start < timeout:
+            ret, frame = ack_cap.read()
+            if not ret:
+                continue
+            cv2.waitKey(1)
+            for obj in decode(frame, symbols=[ZBarSymbol.QRCODE]):
+                text = obj.data.decode("utf-8")
+                mtype, content = qr_protocol.parse_control_msg(text)
+                if mtype in ["ACK", "NACK"]:
+                    return mtype, content
+        return "TIMEOUT", None
+
+    while True:
+        item = outgoing_queue.get()
+
+        try:
+            if item["type"] == "text":
+                data_bytes = item["msg"].encode("utf-8")
+                filename   = f"msg_{int(time.time())}.txt"
+            elif item["type"] == "file":
+                data_bytes = base64.b64decode(item["data_b64"])
+                filename   = item["filename"]
+            else:
+                continue
+
+            aes_key = qr_protocol.generate_aes_key()
+            key_str = qr_protocol.key_to_str(aes_key)
+            payloads = qr_protocol.encode_data_to_payloads(data_bytes, aes_key)
+            total_payloads = len(payloads)
+
+            print(f"[Sender] Sending '{filename}' ({total_payloads} chunks)...")
+
+            qr_images = [qr_protocol.generate_qr_image(p, i+1, total_payloads)
+                         for i, p in enumerate(payloads)]
+
+            # Setup fullscreen window — recreate each time
+            cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
+            cv2.setWindowProperty(WINDOW, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+            cv2.setWindowProperty(WINDOW, cv2.WND_PROP_TOPMOST, 1)
+
+            # Handshake
+            syn_qr = qr_protocol.generate_qr_image(
+                f"SYN:{total_payloads}:{filename}:{key_str}", 0, 0,
+                title="SENDING..."
+            )
+            print("[Sender] Waiting for handshake...")
+            while True:
+                cv2.imshow(WINDOW, syn_qr)
+                cv2.waitKey(1)
+                mtype, mdata = scan_for_ack(timeout=0.5)
+                if mtype == "ACK" and mdata == "READY":
+                    print("[Sender] Handshake complete.")
+                    break
+
+            # Batch transfer
+            FPS   = 3
+            DELAY = int(1000 / FPS)
+            current_batch = 0
+
+            while current_batch * qr_protocol.BATCH_SIZE < total_payloads:
+                s = current_batch * qr_protocol.BATCH_SIZE
+                e = min(s + qr_protocol.BATCH_SIZE, total_payloads)
+                indices = list(range(s, e))
+
+                print(f"[Sender] Batch {current_batch} ({s+1}-{e})...")
+
+                confirmed = False
+                while not confirmed:
+                    for i in indices:
+                        cv2.imshow(WINDOW, qr_images[i])
+                        cv2.waitKey(DELAY)
+
+                    sync_qr = qr_protocol.generate_qr_image(
+                        f"SYNC_CHECK:{current_batch}", 0, 0, title="CHECKING..."
+                    )
+                    cv2.imshow(WINDOW, sync_qr)
+
+                    mtype, mdata = scan_for_ack(timeout=8)
+
+                    if mtype == "ACK" and mdata == current_batch:
+                        confirmed = True
+                        current_batch += 1
+                    elif mtype == "NACK":
+                        new_indices = [x-1 for x in mdata["missing"]
+                                       if 0 <= x-1 < total_payloads]
+                        if new_indices:
+                            indices = new_indices
+                    else:
+                        s = current_batch * qr_protocol.BATCH_SIZE
+                        e = min(s + qr_protocol.BATCH_SIZE, total_payloads)
+                        indices = list(range(s, e))
+
+            # Done — show SENT, then close sender window only
+            done_qr = qr_protocol.generate_qr_image("DONE", 0, 0, title="SENT!")
+            cv2.imshow(WINDOW, done_qr)
+            cv2.waitKey(2000)
+            cv2.destroyWindow(WINDOW)  # only close sender window, NOT all windows
+            print(f"[Sender] '{filename}' sent successfully.")
+
+        except Exception as e:
+            print(f"[Sender error] {e}")
+            import traceback
+            traceback.print_exc()
+
+# ── RECEIVER THREAD ───────────────────────────────────────────────
+def receiver_thread():
+    """
+    Always running on the main thread — watches camera 0.
+    Key fix: never calls destroyAllWindows — only destroys the ACK
+    window when its timer expires. This prevents killing the receiver
+    window after sender finishes.
+    """
+    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    if not cap.isOpened():
+        cap = cv2.VideoCapture(0)
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+
+    WINDOW = "QR Receiver (camera)"
+    cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WINDOW, 640, 360)
+
+    def fresh_state():
+        return {
+            "received_chunks": {},
+            "total_expected":  0,
+            "state":           "WAITING_HANDSHAKE",
+            "filename":        "message.txt",
+            "current_batch":   0,
+            "aes_key":         None,
+            "ack_clear_time":  0,
+        }
+
+    s = fresh_state()
+
+    def show_ack(text, title):
+        img = qr_protocol.generate_qr_image(text, 0, 0, title=title)
+        cv2.namedWindow("ACK", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("ACK", 400, 400)
+        cv2.imshow("ACK", img)
+        cv2.waitKey(1)
+        s["ack_clear_time"] = time.time() + 1.0
+
+    print("[Receiver] Watching camera 0 for incoming QR codes...")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            continue
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        objs = decode(gray, symbols=[ZBarSymbol.QRCODE])
+
+        for obj in objs:
+            data = obj.data.decode("utf-8")
+            pts  = np.array(obj.polygon, dtype=np.int32)
+            cv2.polylines(frame, [pts], True, (0, 255, 0), 3)
+
+            mtype, content = qr_protocol.parse_control_msg(data)
+
+            if s["state"] == "WAITING_HANDSHAKE":
+                if mtype == "SYN":
+                    s["total_expected"] = content["total"]
+                    s["filename"]       = content["filename"]
+                    s["aes_key"]        = qr_protocol.str_to_key(content["key"])
+                    print(f"[Receiver] Handshake: {s['filename']} ({s['total_expected']} chunks)")
+                    show_ack("ACK:READY", "HANDSHAKE ACCEPTED")
+                    s["state"] = "RECEIVING"
+
+            elif s["state"] == "RECEIVING":
+                if mtype == "DATA":
+                    res = qr_protocol.parse_qr_payload(data)
+                    if res:
+                        idx, tot, enc_chunk = res
+                        if idx not in s["received_chunks"]:
+                            s["received_chunks"][idx] = enc_chunk
+                            print(f"[Receiver] Chunk {idx}/{tot}")
+
+                elif mtype == "SYNC_CHECK":
+                    batch_id = content
+                    if batch_id == s["current_batch"]:
+                        start   = batch_id * qr_protocol.BATCH_SIZE
+                        end     = min(start + qr_protocol.BATCH_SIZE, s["total_expected"])
+                        missing = [i for i in range(start+1, end+1)
+                                   if i not in s["received_chunks"]]
+                        if not missing:
+                            show_ack(f"ACK:{batch_id}", "BATCH RECEIVED")
+                            s["current_batch"] += 1
+                        else:
+                            missing_str = ",".join(map(str, missing))
+                            show_ack(f"NACK:{batch_id}:{missing_str}", "RETRY REQUEST")
+
+                elif mtype == "DONE":
+                    print("[Receiver] DONE — rebuilding...")
+                    if s["aes_key"] and len(s["received_chunks"]) == s["total_expected"]:
+                        path = qr_protocol.rebuild_file(
+                            s["received_chunks"], s["total_expected"],
+                            s["aes_key"], s["filename"]
+                        )
+                        if path:
+                            # Auto-generated text messages get filename "msg_<timestamp>.txt"
+                            # — show those as chat text. Everything else: send as a file
+                            # (clickable link in chat).
+                            is_text_message = (s["filename"].startswith("msg_")
+                                               and s["filename"].endswith(".txt"))
+                            if is_text_message:
+                                try:
+                                    with open(path, "r", encoding="utf-8") as f:
+                                        text = f.read()
+                                    send_to_chat({"from": "them", "msg": text})
+                                    print("[Receiver] Message forwarded to chat.")
+                                except Exception:
+                                    pass
+                            else:
+                                # Always treat as file — read raw bytes and send
+                                # to chat computer so it can save locally
+                                with open(path, "rb") as f:
+                                    raw = f.read()
+                                data_b64 = base64.b64encode(raw).decode("utf-8")
+                                send_to_chat({
+                                    "from":     "file",
+                                    "filename": s["filename"],
+                                    "data_b64": data_b64
+                                })
+                                print(f"[Receiver] File forwarded to chat: {s['filename']}")
+                    s = fresh_state()
+
+        # Close ACK window after timer — only this window, nothing else
+        try:
+            if (time.time() > s["ack_clear_time"] and
+                    cv2.getWindowProperty("ACK", cv2.WND_PROP_VISIBLE) >= 1):
+                cv2.destroyWindow("ACK")
+        except Exception:
+            pass
+
+        # Overlay on receiver window
+        cv2.putText(frame, f"RX: {s['state']}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        if s["total_expected"] > 0:
+            cv2.putText(frame,
+                        f"{len(s['received_chunks'])}/{s['total_expected']}",
+                        (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+        cv2.imshow(WINDOW, frame)
+        cv2.waitKey(1)
+
+    cap.release()
+
+# ── SETUP POPUP ───────────────────────────────────────────────────
+def show_setup_popup():
+    """
+    Opens a clean tkinter popup asking for the user's name.
+    Returns the name entered, or exits if cancelled.
+    """
+    root = tk.Tk()
+    root.withdraw()  # hide the main window
+
+    name = simpledialog.askstring(
+        "QR Node Setup",
+        "Enter your name:",
+        parent=root
+    )
+    root.destroy()
+
+    if not name or not name.strip():
+        print("No name entered. Exiting.")
+        exit(0)
+
+    return name.strip()
+
+# ── MAIN ──────────────────────────────────────────────────────────
+def main():
+    global MY_NAME
+
+    # Show popup — no terminal input needed
+    MY_NAME = show_setup_popup()
+    print(f"=== QR Node — {MY_NAME} ===")
+    print(f"Chat computer should connect to this machine's IP on port {CHAT_PORT}")
+    print("Starting all threads...\n")
+
+    # Thread 1: chat socket server
+    threading.Thread(target=chat_server_thread, daemon=True).start()
+
+    # Thread 2: sender (waits for outgoing messages)
+    threading.Thread(target=sender_thread, daemon=True).start()
+
+    # Thread 3: receiver on main thread (OpenCV needs main thread on Windows)
+    receiver_thread()
+
+if __name__ == "__main__":
+    main()
