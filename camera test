@@ -1,0 +1,226 @@
+"""
+camera_test.py
+==============
+Tests camera with a REALISTIC QR — same density and size as the
+real encrypted QRs the system actually sends.
+If this reads cleanly, the real QRs will too.
+
+D — DISPLAY: show test QR on this screen
+S — SCAN:    camera reads the other screen
+"""
+import os
+os.environ["OPENCV_LOG_LEVEL"] = "ERROR"
+os.environ["OPENCV_VIDEOIO_PRIORITY_MSMF"] = "0"
+
+import cv2
+import numpy as np
+import qrcode
+import os
+import base64
+import time
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
+from pyzbar.pyzbar import decode, ZBarSymbol
+
+
+# ── Generate a realistic QR — same as real system ─────────────────
+def make_realistic_test_qr():
+    """
+    Creates a QR that is identical in density to a real encrypted chunk.
+    Uses the same MAX_QR_BYTES=200, same encryption, same border,
+    same box_size and error correction as qr_protocol.py.
+    If this scans — the real ones will too.
+    """
+    # Simulate a real encrypted payload — 200 bytes of base64 data
+    # exactly like encode_data_to_payloads produces
+    aes_key  = os.urandom(32)
+    iv       = os.urandom(12)
+    encryptor = Cipher(
+        algorithms.AES(aes_key), modes.GCM(iv),
+        backend=default_backend()
+    ).encryptor()
+
+    # Make a chunk of exactly 200 base64 chars (same as MAX_QR_BYTES)
+    sample   = b"A" * 150  # 150 bytes -> ~200 base64 chars
+    b64      = base64.b64encode(sample).decode("utf-8")[:200]
+    ct       = encryptor.update(b64.encode()) + encryptor.finalize()
+    tag      = encryptor.tag
+    combined = base64.b64encode(iv + tag + ct).decode("utf-8")
+
+    # Format exactly like a real DATA chunk: "1/5:{encrypted}"
+    payload  = f"1/5:{combined}"
+
+    # Build QR exactly like qr_protocol.generate_qr_image
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=10,
+        border=2
+    )
+    qr.add_data(payload)
+    qr.make(fit=True)
+
+    img_pil = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+    img_cv  = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+
+    # Same green border as real system
+    img_cv  = cv2.copyMakeBorder(img_cv, 50, 50, 50, 50,
+                                  cv2.BORDER_CONSTANT, value=(0, 255, 0))
+
+    cv2.putText(img_cv, "CAMERA TEST — Real density QR",
+                (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
+    return img_cv
+
+
+def display_mode():
+    print("\n[DISPLAY] Showing realistic test QR fullscreen.")
+    print("Go to the OTHER computer and run SCAN mode.")
+    print("Press Q to quit.\n")
+
+    qr_img = make_realistic_test_qr()
+    WINDOW = "Camera Test — DISPLAY"
+    cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
+    cv2.setWindowProperty(WINDOW, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+    cv2.setWindowProperty(WINDOW, cv2.WND_PROP_TOPMOST, 1)
+
+    while True:
+        cv2.imshow(WINDOW, qr_img)
+        if cv2.waitKey(100) & 0xFF in (ord('q'), 27):
+            break
+
+    cv2.destroyAllWindows()
+
+
+def scan_mode():
+    print("\n[SCAN] Opening camera — point at other screen.")
+    print("GREEN BOX = good position, camera will work with real QRs.")
+    print("Press Q to quit | 1 or 2 to switch cameras.\n")
+
+    cam_index = 0
+
+    def open_cam(idx):
+        cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+        if not cap.isOpened():
+            cap = cv2.VideoCapture(idx)
+        if not cap.isOpened():
+            print(f"  ❌ Camera {idx} not found.")
+            return None
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        print(f"  ✅ Camera {idx} opened.")
+        return cap
+
+    cap = open_cam(cam_index)
+    if cap is None:
+        print("No camera found. Check USB connection.")
+        return
+
+    WINDOW    = "Camera Test — SCAN"
+    success   = 0
+    fail_tick = 0
+
+    cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WINDOW, 960, 540)
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            continue
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        objs = decode(gray, symbols=[ZBarSymbol.QRCODE])
+
+        if objs:
+            fail_tick = 0
+            for obj in objs:
+                pts = np.array(obj.polygon, dtype=np.int32)
+                cv2.polylines(frame, [pts], True, (0, 255, 0), 4)
+                success += 1
+
+                cv2.rectangle(frame, (0, 0), (frame.shape[1], 70),
+                              (0, 180, 0), -1)
+                cv2.putText(frame,
+                            f"✓ REAL-DENSITY QR READ OK  (count: {success})"
+                            f"  — This position will work!",
+                            (15, 45), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.8, (255, 255, 255), 2)
+        else:
+            fail_tick += 1
+            if fail_tick < 15:
+                msg = "Searching for QR..."
+            elif fail_tick < 60:
+                msg = "⚠  Move closer or adjust angle — real QRs are dense"
+            else:
+                msg = "✗  Cannot read — adjust position, lighting or distance"
+
+            cv2.rectangle(frame, (0, 0), (frame.shape[1], 70),
+                          (0, 0, 180), -1)
+            cv2.putText(frame, msg, (15, 45),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+
+        # Tips
+        tips = [
+            "TIPS:",
+            "30 - 80cm from screen",
+            "Screen brightness: MAX",
+            "No glare / tilt screen",
+            "Camera must be steady",
+            "1 / 2 to switch camera",
+        ]
+        for i, t in enumerate(tips):
+            cv2.putText(frame, t,
+                        (frame.shape[1] - 320, 100 + i * 28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 180, 0), 1)
+
+        cv2.putText(frame,
+                    f"Camera {cam_index}  |  Successful reads: {success}",
+                    (10, frame.shape[0] - 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+
+        cv2.imshow(WINDOW, frame)
+        key = cv2.waitKey(1) & 0xFF
+
+        if key in (ord('q'), 27):
+            break
+        elif key == ord('1') and cam_index != 0:
+            cap.release()
+            cam_index = 0
+            cap = open_cam(0) or cap
+        elif key == ord('2') and cam_index != 1:
+            new = open_cam(1)
+            if new:
+                cap.release()
+                cam_index = 1
+                cap = new
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+    if success > 0:
+        print(f"\n✅ Camera {cam_index} works with real-density QRs!")
+        print("You are ready to run qr_node.py.")
+    else:
+        print("\n❌ Could not read. Adjust camera and try again.")
+
+
+def main():
+    print("=== Camera Test (Real QR Density) ===")
+    print("The test QR is identical in size and density to real encrypted QRs.")
+    print("If this reads — the real system will work too.\n")
+    print("D — DISPLAY: show test QR on THIS screen")
+    print("S — SCAN:    use THIS camera to read the other screen")
+
+    while True:
+        choice = input("\nChoose D or S: ").strip().upper()
+        if choice == "D":
+            display_mode()
+            break
+        elif choice == "S":
+            scan_mode()
+            break
+        else:
+            print("Type D or S.")
+
+
+if __name__ == "__main__":
+    main()
