@@ -1,0 +1,405 @@
+"""
+chat_ui.py
+==========
+Runs on the CHAT computer.
+Opens a setup popup automatically — no terminal input needed.
+"""
+
+import tkinter as tk
+from tkinter import scrolledtext, filedialog, simpledialog, messagebox, ttk
+import socket
+import threading
+import json
+import os
+import time
+import base64
+from datetime import datetime
+
+MY_NAME    = ""
+THEIR_NAME = ""
+QR_HOST    = ""
+QR_PORT    = 6000
+
+sock      = None
+connected = False
+
+# ── NETWORK ───────────────────────────────────────────────────────
+def connect_to_qr_node(host, port, ui_callback):
+    global sock, connected
+    while True:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.connect((host, port))
+            connected = True
+            ui_callback("system", "System", f"Connected to QR computer at {host}:{port}")
+            buffer = b""
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                buffer += chunk
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    line = line.strip()
+                    if line:
+                        try:
+                            data = json.loads(line.decode("utf-8"))
+                            frm  = data.get("from", "")
+                            msg  = data.get("msg", "")
+                            if frm == "system":
+                                ui_callback("progress", "system", msg)
+                            elif frm == "file":
+                                ui_callback("file", data["filename"],
+                                            data["data_b64"])
+                            else:
+                                ui_callback("msg", frm, msg)
+                        except Exception:
+                            pass
+        except Exception:
+            connected = False
+            ui_callback("system", "System", "Disconnected. Retrying in 3s...")
+            time.sleep(3)
+
+def send_to_qr_node(payload):
+    global sock, connected
+    if not connected or sock is None:
+        return False
+    try:
+        sock.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+        return True
+    except Exception:
+        connected = False
+        return False
+
+# ── SETUP POPUP ───────────────────────────────────────────────────
+def show_setup_popup():
+    """
+    Shows a clean popup window asking for name, their name, and QR IP.
+    Returns (my_name, their_name, qr_host) or exits if cancelled.
+    """
+    popup = tk.Tk()
+    popup.title("Secure QR Chat — Setup")
+    popup.geometry("400x280")
+    popup.configure(bg="#1e1e2e")
+    popup.resizable(False, False)
+
+    # Center the window
+    popup.update_idletasks()
+    x = (popup.winfo_screenwidth() - 400) // 2
+    y = (popup.winfo_screenheight() - 280) // 2
+    popup.geometry(f"400x280+{x}+{y}")
+
+    result = {"done": False, "values": None}
+
+    tk.Label(popup, text="Secure QR Chat", font=("Arial", 16, "bold"),
+             fg="#cdd6f4", bg="#1e1e2e").pack(pady=(20, 4))
+    tk.Label(popup, text="Enter your details to start",
+             font=("Arial", 10), fg="#a6adc8", bg="#1e1e2e").pack(pady=(0, 16))
+
+    frame = tk.Frame(popup, bg="#1e1e2e")
+    frame.pack(padx=30, fill=tk.X)
+
+    def make_row(label_text, default=""):
+        row = tk.Frame(frame, bg="#1e1e2e")
+        row.pack(fill=tk.X, pady=4)
+        tk.Label(row, text=label_text, font=("Arial", 10), fg="#a6adc8",
+                 bg="#1e1e2e", width=16, anchor="w").pack(side=tk.LEFT)
+        entry = tk.Entry(row, font=("Arial", 11), bg="#45475a", fg="#cdd6f4",
+                         insertbackground="#cdd6f4", relief=tk.FLAT,
+                         highlightthickness=1, highlightcolor="#89b4fa")
+        entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4)
+        if default:
+            entry.insert(0, default)
+        return entry
+
+    e_name  = make_row("Your name:")
+    e_them  = make_row("Their name:")
+    e_ip    = make_row("QR computer IP:")
+
+    def on_start():
+        name = e_name.get().strip()
+        them = e_them.get().strip()
+        ip   = e_ip.get().strip()
+        if not name or not them or not ip:
+            messagebox.showerror("Missing info", "Please fill in all fields.", parent=popup)
+            return
+        result["values"] = (name, them, ip)
+        result["done"] = True
+        popup.destroy()
+
+    def on_cancel():
+        popup.destroy()
+        exit(0)
+
+    popup.bind("<Return>", lambda e: on_start())
+    popup.protocol("WM_DELETE_WINDOW", on_cancel)
+
+    tk.Button(popup, text="Start Chat", font=("Arial", 11, "bold"),
+              bg="#89b4fa", fg="#1e1e2e", relief=tk.FLAT,
+              padx=20, pady=8, cursor="hand2",
+              command=on_start).pack(pady=16)
+
+    popup.mainloop()
+
+    if not result["done"]:
+        exit(0)
+
+    return result["values"]
+
+# ── CHAT UI ───────────────────────────────────────────────────────
+class ChatUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title(f"Secure QR Chat — {MY_NAME}")
+        self.root.geometry("600x700")
+        self.root.configure(bg="#1e1e2e")
+
+        header = tk.Frame(root, bg="#313244", pady=10)
+        header.pack(fill=tk.X)
+        tk.Label(header, text="Secure QR Chat",
+                 font=("Arial", 16, "bold"), fg="#cdd6f4", bg="#313244").pack()
+        tk.Label(header, text=f"You: {MY_NAME}   |   Talking to: {THEIR_NAME}",
+                 font=("Arial", 10), fg="#a6adc8", bg="#313244").pack()
+
+        self.status_var = tk.StringVar(value="Connecting to QR computer...")
+        tk.Label(root, textvariable=self.status_var,
+                 font=("Arial", 9), fg="#a6e3a1", bg="#181825",
+                 anchor="w", padx=10).pack(fill=tk.X)
+
+        # Progress bar — hidden until transfer starts
+        self._prog_visible = False
+        self._prog_frame = tk.Frame(root, bg="#181825", padx=10, pady=2)
+        self._prog_label = tk.Label(self._prog_frame, text="",
+                                    font=("Arial", 9), fg="#a6adc8",
+                                    bg="#181825", anchor="w")
+        self._prog_label.pack(fill=tk.X)
+        self._prog_bar = ttk.Progressbar(self._prog_frame, mode="determinate")
+        self._prog_bar.pack(fill=tk.X)
+
+        self.chat_display = scrolledtext.ScrolledText(
+            root, state="disabled", wrap=tk.WORD,
+            font=("Arial", 11), bg="#1e1e2e", fg="#cdd6f4",
+            insertbackground="#cdd6f4", relief=tk.FLAT, padx=10, pady=10
+        )
+        self.chat_display.pack(fill=tk.BOTH, expand=True, padx=10, pady=(10, 0))
+
+        self.chat_display.tag_config("me",     foreground="#89b4fa", font=("Arial", 11, "bold"))
+        self.chat_display.tag_config("them",   foreground="#a6e3a1", font=("Arial", 11, "bold"))
+        self.chat_display.tag_config("system", foreground="#6c7086", font=("Arial", 10, "italic"))
+        self.chat_display.tag_config("time",   foreground="#585b70", font=("Arial", 9))
+        self.chat_display.tag_config("body",   foreground="#cdd6f4")
+
+        input_frame = tk.Frame(root, bg="#313244", pady=8, padx=10)
+        input_frame.pack(fill=tk.X, side=tk.BOTTOM)
+
+        self.msg_input = tk.Text(
+            input_frame, height=3, font=("Arial", 11),
+            bg="#45475a", fg="#cdd6f4", insertbackground="#cdd6f4",
+            relief=tk.FLAT, wrap=tk.WORD
+        )
+        self.msg_input.pack(fill=tk.X, side=tk.LEFT, expand=True, padx=(0, 8))
+        self.msg_input.bind("<Return>", self.on_enter)
+
+        btn_frame = tk.Frame(input_frame, bg="#313244")
+        btn_frame.pack(side=tk.RIGHT)
+
+        tk.Button(btn_frame, text="Send",
+                  font=("Arial", 11, "bold"), bg="#89b4fa", fg="#1e1e2e",
+                  relief=tk.FLAT, padx=16, pady=8, cursor="hand2",
+                  command=self.send_message).pack(fill=tk.X, pady=(0, 4))
+
+        tk.Button(btn_frame, text="Send File",
+                  font=("Arial", 10), bg="#313244", fg="#cdd6f4",
+                  relief=tk.FLAT, padx=16, pady=4, cursor="hand2",
+                  command=self.send_file).pack(fill=tk.X)
+
+        self.add_system("Chat ready. Point the QR camera at the other person's screen.")
+
+        threading.Thread(
+            target=connect_to_qr_node,
+            args=(QR_HOST, QR_PORT, self.thread_safe_callback),
+            daemon=True
+        ).start()
+
+    def thread_safe_callback(self, kind, sender, content, extra=None):
+        self.root.after(0, lambda: self.handle_incoming(kind, sender, content, extra))
+
+    def handle_incoming(self, kind, sender, content, extra=None):
+        if kind == "msg":
+            self.add_message(sender, content, "them")
+            self.status_var.set(f"Message received from {sender}")
+        elif kind == "file":
+            # content = filename, extra = data_b64
+            filename = sender
+            data_b64 = content
+            self._save_and_show_file(filename, data_b64)
+        elif kind == "system":
+            self.add_system(content)
+            if "Connected" in content:
+                self.status_var.set("Connected to QR computer. Ready.")
+        elif kind == "progress":
+            self.status_var.set(content)
+            import re
+            m = re.search(r"(\d+)/(\d+)", content)
+            if m:
+                pct = int(m.group(1)) / int(m.group(2)) * 100
+                self._prog_bar["value"] = pct
+                self._prog_label.config(text=content)
+                if not self._prog_visible:
+                    self._prog_frame.pack(fill=tk.X,
+                                          before=self.chat_display)
+                    self._prog_visible = True
+            if "✅" in content:
+                self._prog_bar["value"] = 100
+                self._prog_label.config(text=content)
+                if not self._prog_visible:
+                    self._prog_frame.pack(fill=tk.X,
+                                          before=self.chat_display)
+                    self._prog_visible = True
+                self.add_system(content)
+                self.root.after(3000, self._hide_prog)
+
+    def _save_and_show_file(self, filename, data_b64):
+        """Save received file to Downloads folder and show clickable link."""
+        import subprocess
+        import platform
+
+        # Save to Downloads folder
+        downloads = os.path.join(os.path.expanduser("~"), "Downloads",
+                                 "QR_Received")
+        os.makedirs(downloads, exist_ok=True)
+        filepath = os.path.join(downloads, filename)
+
+        try:
+            raw = base64.b64decode(data_b64)
+            with open(filepath, "wb") as f:
+                f.write(raw)
+
+            # Show clickable link in chat
+            self.chat_display.config(state="normal")
+            self.chat_display.insert(tk.END, f"\nthem  ", "them")
+            self.chat_display.insert(tk.END,
+                                     f"{datetime.now().strftime('%H:%M')}\n",
+                                     "time")
+
+            # Insert clickable link
+            tag = f"file_{filename}_{id(filepath)}"
+            self.chat_display.insert(tk.END,
+                                     f"  📎 {filename}  (click to open)\n",
+                                     tag)
+            self.chat_display.tag_config(tag,
+                                         foreground="#89dceb",
+                                         underline=True,
+                                         font=("Arial", 11))
+            # Capture filepath in closure
+            fp = filepath
+            self.chat_display.tag_bind(tag, "<Button-1>",
+                                       lambda e, p=fp: self._open_file(p))
+            self.chat_display.tag_bind(tag, "<Enter>",
+                lambda e: self.chat_display.config(cursor="hand2"))
+            self.chat_display.tag_bind(tag, "<Leave>",
+                lambda e: self.chat_display.config(cursor=""))
+
+            self.chat_display.config(state="disabled")
+            self.chat_display.see(tk.END)
+
+            self.status_var.set(f"File saved: {filepath}")
+
+        except Exception as e:
+            self.add_system(f"Error saving file {filename}: {e}")
+
+    def _open_file(self, path):
+        """Open file with default system application."""
+        import subprocess
+        import platform
+        try:
+            if platform.system() == "Windows":
+                os.startfile(path)
+            elif platform.system() == "Darwin":
+                subprocess.call(["open", path])
+            else:
+                subprocess.call(["xdg-open", path])
+        except Exception as e:
+            self.add_system(f"Could not open file: {e}")
+
+    def _hide_prog(self):
+        self._prog_frame.pack_forget()
+        self._prog_visible = False
+        self._prog_bar["value"] = 0
+
+    def timestamp(self):
+        return datetime.now().strftime("%H:%M")
+
+    def add_system(self, text):
+        self.chat_display.config(state="normal")
+        self.chat_display.insert(tk.END, f"  {text}\n", "system")
+        self.chat_display.config(state="disabled")
+        self.chat_display.see(tk.END)
+
+    def add_message(self, sender, text, tag):
+        self.chat_display.config(state="normal")
+        self.chat_display.insert(tk.END, f"\n{sender}  ", tag)
+        self.chat_display.insert(tk.END, f"{self.timestamp()}\n", "time")
+        self.chat_display.insert(tk.END, f"  {text}\n", "body")
+        self.chat_display.config(state="disabled")
+        self.chat_display.see(tk.END)
+
+    def on_enter(self, event):
+        if not event.state & 0x1:
+            self.send_message()
+            return "break"
+
+    def send_message(self):
+        text = self.msg_input.get("1.0", tk.END).strip()
+        if not text:
+            return
+        self.msg_input.delete("1.0", tk.END)
+        ok = send_to_qr_node({"type": "text", "from": MY_NAME, "msg": text})
+        if ok:
+            self.add_message(f"You ({MY_NAME})", text, "me")
+            self.status_var.set("Sending via QR...")
+        else:
+            self.add_system("Not connected to QR computer.")
+
+    def send_file(self):
+        path = filedialog.askopenfilename(title="Choose a file to send")
+        if not path:
+            return
+        filename = os.path.basename(path)
+        size_kb  = os.path.getsize(path) // 1024
+
+        def do_send():
+            try:
+                with open(path, "rb") as f:
+                    data_b64 = base64.b64encode(f.read()).decode("utf-8")
+                ok = send_to_qr_node({"type": "file", "from": MY_NAME,
+                                      "filename": filename,
+                                      "data_b64": data_b64})
+                def update():
+                    if ok:
+                        self.add_message(f"You ({MY_NAME})",
+                                         f"📎 Sending: {filename} ({size_kb}KB)",
+                                         "me")
+                        self.status_var.set(f"File queued: {filename}")
+                    else:
+                        self.add_system("Not connected to QR computer.")
+                self.root.after(0, update)
+            except Exception as e:
+                self.root.after(0, lambda: self.add_system(
+                    f"Error reading file: {e}"))
+
+        threading.Thread(target=do_send, daemon=True).start()
+
+# ── MAIN ──────────────────────────────────────────────────────────
+def main():
+    global MY_NAME, THEIR_NAME, QR_HOST
+
+    # Show setup popup — no terminal needed
+    MY_NAME, THEIR_NAME, QR_HOST = show_setup_popup()
+
+    root = tk.Tk()
+    ChatUI(root)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
