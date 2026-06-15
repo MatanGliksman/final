@@ -280,6 +280,7 @@ def receiver_thread():
                 elif mtype == "SYNC_CHECK":
                     batch_id = content
                     if batch_id == s["current_batch"]:
+                        # Current batch — check missing and ACK or NACK
                         start   = batch_id * qr_protocol.BATCH_SIZE
                         end     = min(start + qr_protocol.BATCH_SIZE, s["total_expected"])
                         missing = [i for i in range(start+1, end+1)
@@ -290,6 +291,11 @@ def receiver_thread():
                         else:
                             missing_str = ",".join(map(str, missing))
                             show_ack(f"NACK:{batch_id}:{missing_str}", "RETRY REQUEST")
+                    elif batch_id < s["current_batch"]:
+                        # Sender re-asking about an already-finished batch
+                        # — means it didn't see our previous ACK. Re-send it.
+                        print(f"[Receiver] Re-sending ACK for batch {batch_id}")
+                        show_ack(f"ACK:{batch_id}", "BATCH RECEIVED (resend)")
 
                 elif mtype == "DONE":
                     print("[Receiver] DONE — rebuilding...")
@@ -299,31 +305,14 @@ def receiver_thread():
                             s["aes_key"], s["filename"]
                         )
                         if path:
-                            # Auto-generated text messages get filename "msg_<timestamp>.txt"
-                            # — show those as chat text. Everything else: send as a file
-                            # (clickable link in chat).
-                            is_text_message = (s["filename"].startswith("msg_")
-                                               and s["filename"].endswith(".txt"))
-                            if is_text_message:
-                                try:
-                                    with open(path, "r", encoding="utf-8") as f:
-                                        text = f.read()
-                                    send_to_chat({"from": "them", "msg": text})
-                                    print("[Receiver] Message forwarded to chat.")
-                                except Exception:
-                                    pass
-                            else:
-                                # Always treat as file — read raw bytes and send
-                                # to chat computer so it can save locally
-                                with open(path, "rb") as f:
-                                    raw = f.read()
-                                data_b64 = base64.b64encode(raw).decode("utf-8")
-                                send_to_chat({
-                                    "from":     "file",
-                                    "filename": s["filename"],
-                                    "data_b64": data_b64
-                                })
-                                print(f"[Receiver] File forwarded to chat: {s['filename']}")
+                            try:
+                                with open(path, "r", encoding="utf-8") as f:
+                                    text = f.read()
+                                send_to_chat({"from": "them", "msg": text})
+                                print("[Receiver] Message forwarded to chat.")
+                            except Exception:
+                                send_to_chat({"from": "them",
+                                              "msg": f"[File: {s['filename']}]"})
                     s = fresh_state()
 
         # Close ACK window after timer — only this window, nothing else
